@@ -35,8 +35,8 @@ done
 read -p "Enter a prefix for key names (default: 'key'): " key_prefix
 key_prefix=${key_prefix:-key}
 
-# Set home directory (fixed to ./home/ft/.poktroll)
-home_dir="/home/ft/.poktroll"
+# Set home directory
+home_dir="~/.pocket"
 print_color $BLUE "Using home directory: $home_dir"
 
 # Create output file
