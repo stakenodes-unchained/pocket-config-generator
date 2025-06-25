@@ -2,6 +2,7 @@ import os
 import sys
 import pandas as pd
 import yaml
+import re
 
 def load_service_mapping():
 	"""Load the Morse to Shannon service ID mapping."""
@@ -32,9 +33,9 @@ def load_wallet_data():
 
 def extract_morse_chain_id(service_id):
 	"""Extract Morse Chain ID from service ID string (e.g., 'Avalanche (F003)' -> 'F003')."""
-	import re
-	match = re.search(r'\(([A-F0-9]{4})\)', service_id)
-	return match.group(1) if match else None
+    	service_id = str(service_id)   
+    	match = re.search(r'\(([A-F0-9]{4})\)', service_id)
+    	return match.group(1) if match else None
 
 def main():
 	# Create output directory if it doesn't exist
@@ -54,12 +55,12 @@ def main():
 	filename = input("Enter the csv received from PNF with the F-Chains node allocations (Case-sensitive): ")
 	df = pd.read_csv(filename)
  
-	# drop last column from df
+    	# drop last column from df
 	df = df.iloc[:, :-1]
-	# drop last row from df
-	df = df.iloc[:-1, :]
-	# replace all NaN with 0
-	df = df.fillna(0)
+    	# drop last row from df if it's empty or total
+   	df = df.dropna(how='all', subset=df.columns[:4])
+    	# replace all NaN with 0
+    	df = df.fillna(0)
 	
 	# Get the numeric columns (excluding 'Chains', 'Node Type', 'StakeNodes')
 	numeric_columns = [col for col in df.columns[3:] if col.isdigit()]
@@ -103,9 +104,15 @@ def main():
 		
 		# Add services for this customer
 		for index, row in df.iterrows():
-			if row[col_num] != 0:
-				original_service_id = row['Chains']
-				morse_chain_id = extract_morse_chain_id(original_service_id)
+    			# Only consider valid and nonzero allocations
+    			if row[col_num] == 0:
+        			continue
+
+    				original_service_id = row['Chains']
+    				# Skip rows where Chains is 0, empty, or not a string with a valid pattern
+    				morse_chain_id = extract_morse_chain_id(original_service_id)
+    				if not morse_chain_id:
+       				 	continue                    
 				
 				node_type = row['Node Type']
 				
