@@ -1,0 +1,493 @@
+#!/bin/bash
+
+# Pocket Network Supplier Staking Script
+# This script reads supplier service mappings and stakes/restakes suppliers
+
+set -e  # Exit on any error
+
+# Configuration variables (set via command line flags)
+FEES="20000upokt"  # Default fees
+CHAIN_ID=""
+SUPPLIER_SVC_MAP_FILE=""
+TEMP_CONFIG_DIR="/tmp"  # Default to /tmp
+HOME_DIR="$HOME/.pocket"  # Default to ~/.pocket
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_info() {
+    echo -e "${BLUE}ℹ️  [INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}✅ [SUCCESS]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠️  [WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}❌ [ERROR]${NC} $1"
+}
+
+# Function to display usage
+usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Options:
+    -f, --file FILE         Path to supplier service mapping file (required)
+    --network NETWORK       Network to use: 'main' or 'beta' (required)
+    --fees FEES             Transaction fees (default: 20000upokt)
+    --home HOME_DIR         Home directory for pocketd (default: ~/.pocket)
+    --temp-dir DIR          Temporary config directory (default: /tmp)
+    --dry-run               Show what would be executed without running commands
+    --single OWNER_ADDRESS  Stake only a single supplier by owner address
+    -h, --help              Show this help message
+
+Network Options:
+    --network main          Use mainnet (https://shannon-grove-rpc.mainnet.poktroll.com, chain-id: pocket)
+    --network beta          Use beta testnet (https://shannon-testnet-grove-rpc.beta.poktroll.com, chain-id: pocket-beta)
+
+File Format:
+Each line should contain space-separated values:
+<SERVICE_ID> <OWNER_ADDRESS> <OPERATOR_ADDRESS> <STAKE_AMOUNT_TO_INCREASE> <RELAYMINER_URL> [<REV_SHARE_ADDR1> <REV_SHARE_PCT1> ...]
+
+Examples:
+    $0 --network main --home /home/user/.poktroll -f supplier-svc-map.txt
+    $0 -f my-suppliers.txt --network beta --home /home/user/.poktroll --dry-run
+    $0 --single pokt165uqhq43j7xqjnlv53kzsfjn55kecpg4ejyfns --network main --home /home/user/.poktroll -f supplier-svc-map.txt
+    $0 --home /custom/path/.poktroll/ --network main -f supplier-svc-map.txt
+    $0 --fees 300000upokt --network beta --home /home/user/.poktroll -f supplier-svc-map.txt
+    $0 --temp-dir /custom/tmp --network main --home /home/user/.poktroll -f supplier-svc-map.txt
+
+File Example:
+    anvil pokt1owner123... pokt1operator123... 1000000000 http://192.168.1.100:8545
+    eth pokt1owner456... pokt1operator456... 2000000000 https://relay.example.com pokt1revshare123... 30 pokt1revshare456... 20
+
+EOF
+}
+
+# Function to get current stake amount for a supplier
+get_current_stake() {
+    local operator_address="$1"
+    
+    # Print info messages to stderr so they don't interfere with command substitution
+    print_info "🔍 Querying current stake for supplier operator: $operator_address" >&2
+    
+    # Query the supplier details
+    local query_cmd="pocketd query supplier show-supplier \"$operator_address\" --node=\"$NODE\" --chain-id \"$CHAIN_ID\" --home \"$HOME_DIR\" --output json"
+    
+    if [ "$DRY_RUN" = true ]; then
+        print_warning "DRY RUN - Executing query: $query_cmd" >&2
+    fi
+    
+    local query_result
+    if ! query_result=$(eval "$query_cmd" 2>/dev/null); then
+        # Check if the error indicates supplier not found
+        local error_output
+        error_output=$(eval "$query_cmd" 2>&1 || true)
+        if echo "$error_output" | grep -q "supplier not found\|key not found"; then
+            print_warning "🆕 Supplier not found: $operator_address - treating as new supplier" >&2
+            echo "NEW_SUPPLIER"
+            return 0
+        else
+            print_error "Failed to query supplier: $operator_address" >&2
+            print_error "Error: $error_output" >&2
+            return 1
+        fi
+    fi
+    
+    # Extract the stake amount using jq or grep/awk fallback
+    local current_amount
+    if command -v jq >/dev/null 2>&1; then
+        current_amount=$(echo "$query_result" | jq -r '.supplier.stake.amount // empty')
+    else
+        # Fallback using grep and sed for systems without jq
+        current_amount=$(echo "$query_result" | grep -o '"amount"[[:space:]]*:[[:space:]]*"[0-9]*"' | sed 's/.*"\([0-9]*\)".*/\1/')
+    fi
+    
+    if [ -z "$current_amount" ] || [ "$current_amount" = "null" ]; then
+        print_error "Could not extract current stake amount for $operator_address" >&2
+        return 1
+    fi
+    
+    print_info "💰 Current stake amount: ${current_amount}upokt" >&2
+    echo "$current_amount"
+}
+
+# Function to create temporary config file
+create_supplier_config_file() {
+    local service_id="$1"
+    local owner_address="$2"
+    local operator_address="$3"
+    local stake_amount="$4"
+    local relayminer_url="$5"
+    local config_file="$6"
+    shift 6
+    local rev_share_args=("$@")
+    
+    # Ensure temp directory exists
+    if [ ! -d "$TEMP_CONFIG_DIR" ]; then
+        mkdir -p "$TEMP_CONFIG_DIR"
+        print_info "📁 Created temporary directory: $TEMP_CONFIG_DIR"
+    fi
+    
+    # Start creating the config file
+    cat > "$config_file" << EOF
+owner_address: $owner_address
+operator_address: $operator_address
+stake_amount: ${stake_amount}upokt
+default_rev_share_percent:
+EOF
+    
+    # Handle revenue sharing
+    if [ ${#rev_share_args[@]} -eq 0 ]; then
+        # No revenue sharing specified, owner gets 100%
+        cat >> "$config_file" << EOF
+  $owner_address: 100
+services:
+  - service_id: "$service_id"
+    endpoints:
+      - publicly_exposed_url: $relayminer_url
+        rpc_type: JSON_RPC
+EOF
+    else
+        # Process revenue sharing arguments
+        local remaining_percentage=100
+        local rev_share_entries=""
+        
+        # Process pairs of address and percentage
+        for ((i=0; i<${#rev_share_args[@]}; i+=2)); do
+            if [ $((i+1)) -lt ${#rev_share_args[@]} ]; then
+                local addr="${rev_share_args[i]}"
+                local pct="${rev_share_args[i+1]}"
+                
+                # Validate percentage is numeric
+                if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid percentage: $pct for address: $addr"
+                    return 1
+                fi
+                
+                if [ "$pct" -gt 100 ]; then
+                    print_error "Percentage cannot exceed 100: $pct for address: $addr"
+                    return 1
+                fi
+                
+                rev_share_entries="${rev_share_entries}  $addr: $pct\n"
+                remaining_percentage=$((remaining_percentage - pct))
+            fi
+        done
+        
+        # Ensure remaining percentage is valid
+        if [ "$remaining_percentage" -lt 0 ]; then
+            print_error "Total revenue share percentages exceed 100%"
+            return 1
+        fi
+        
+        # Add owner's remaining percentage if any
+        if [ "$remaining_percentage" -gt 0 ]; then
+            rev_share_entries="${rev_share_entries}  $owner_address: $remaining_percentage\n"
+        fi
+        
+        # Write revenue sharing to config
+        echo -e "$rev_share_entries" >> "$config_file"
+        
+        # Add services section
+        cat >> "$config_file" << EOF
+services:
+  - service_id: "$service_id"
+    endpoints:
+      - publicly_exposed_url: $relayminer_url
+        rpc_type: JSON_RPC
+EOF
+    fi
+    
+    print_info "📝 Created supplier config file: $config_file"
+}
+
+# Function to stake a single supplier
+stake_supplier() {
+    local service_id="$1"
+    local owner_address="$2"
+    local operator_address="$3"
+    local stake_increment="$4"
+    local relayminer_url="$5"
+    shift 5
+    local rev_share_args=("$@")
+    
+    local config_file="$TEMP_CONFIG_DIR/stake_supplier_${operator_address}_config.yaml"
+    
+    print_info "🏭 Processing supplier: owner=$owner_address, operator=$operator_address, service=$service_id"
+    
+    # Get current stake amount
+    local current_stake
+    if ! current_stake=$(get_current_stake "$operator_address"); then
+        print_error "Failed to get current stake for operator: $operator_address"
+        return 1
+    fi
+    
+    local new_stake
+    local is_new_supplier=false
+    
+    if [ "$current_stake" = "NEW_SUPPLIER" ]; then
+        # This is a new supplier, use the stake increment as the initial stake
+        new_stake="$stake_increment"
+        is_new_supplier=true
+        print_warning "🌟 Staking new supplier: operator=$operator_address"
+        print_info "💎 New stake amount: ${new_stake}upokt (new supplier)"
+    else
+        # Existing supplier, increment stake by configured amount
+        new_stake=$((current_stake + stake_increment))
+        print_info "📈 New stake amount: ${new_stake}upokt (current: ${current_stake}upokt + $stake_increment)"
+    fi
+    
+    # Create temporary config file
+    if ! create_supplier_config_file "$service_id" "$owner_address" "$operator_address" "$new_stake" "$relayminer_url" "$config_file" "${rev_share_args[@]}"; then
+        print_error "Failed to create config file for supplier: $operator_address"
+        return 1
+    fi
+    
+    # Construct the staking command
+    local cmd="pocketd tx supplier stake-supplier --config=\"$config_file\" --from \"$owner_address\" --node=\"$NODE\" --chain-id \"$CHAIN_ID\" --fees \"$FEES\" --home \"$HOME_DIR\" -y"
+    
+    if [ "$DRY_RUN" = true ]; then
+        if [ "$is_new_supplier" = true ]; then
+            print_warning "🧪 DRY RUN - Would execute (NEW SUPPLIER): $cmd"
+        else
+            print_warning "🧪 DRY RUN - Would execute (RESTAKE SUPPLIER): $cmd"
+        fi
+        print_info "📄 DRY RUN - Config file content would be:"
+        cat "$config_file"
+        return 0
+    fi
+    
+    if [ "$is_new_supplier" = true ]; then
+        print_info "🚀 Executing staking command for new supplier $operator_address..."
+    else
+        print_info "⚡ Executing restaking command for supplier $operator_address..."
+    fi
+    
+    # Execute the command
+    if eval "$cmd"; then
+        if [ "$is_new_supplier" = true ]; then
+            print_success "🎉 Successfully staked new supplier: operator=$operator_address (${new_stake}upokt)"
+        else
+            print_success "🎯 Successfully restaked supplier: operator=$operator_address (${new_stake}upokt)"
+        fi
+        
+        # Clean up temporary config file
+        rm -f "$config_file"
+    else
+        if [ "$is_new_supplier" = true ]; then
+            print_error "💥 Failed to stake new supplier: operator=$operator_address"
+        else
+            print_error "💥 Failed to restake supplier: operator=$operator_address"
+        fi
+        return 1
+    fi
+    
+    echo "----------------------------------------"
+}
+
+# Parse command line arguments
+NODE=""
+NETWORK=""
+DRY_RUN=false
+SINGLE_SUPPLIER=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -f|--file)
+            SUPPLIER_SVC_MAP_FILE="$2"
+            shift 2
+            ;;
+        --network)
+            NETWORK="$2"
+            shift 2
+            ;;
+        --fees)
+            FEES="$2"
+            shift 2
+            ;;
+        --home)
+            HOME_DIR="$2"
+            shift 2
+            ;;
+        --temp-dir)
+            TEMP_CONFIG_DIR="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --single)
+            SINGLE_SUPPLIER="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            print_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Check for required parameters
+if [ -z "$NETWORK" ]; then
+    print_error "Network is required. Use --network option with 'main' or 'beta'."
+    exit 1
+fi
+
+# Set NODE and CHAIN_ID based on network
+case "$NETWORK" in
+    main)
+        NODE="https://shannon-grove-rpc.mainnet.poktroll.com"
+        CHAIN_ID="pocket"
+        ;;
+    beta)
+        NODE="https://shannon-testnet-grove-rpc.beta.poktroll.com"
+        CHAIN_ID="pocket-beta"
+        ;;
+    *)
+        print_error "Invalid network: $NETWORK. Use 'main' or 'beta'."
+        exit 1
+        ;;
+esac
+
+if [ -z "$HOME_DIR" ]; then
+    print_error "Home directory is required. Use --home option."
+    exit 1
+fi
+
+if [ -z "$SUPPLIER_SVC_MAP_FILE" ]; then
+    print_error "Supplier service mapping file is required. Use -f/--file option."
+    exit 1
+fi
+
+print_info "🌐 Using network: $NETWORK"
+print_info "🔗 Using node endpoint: $NODE"
+print_info "⛓️  Chain ID: $CHAIN_ID"
+print_info "💸 Fees: $FEES"
+print_info "🏠 Home directory: $HOME_DIR"
+print_info "📂 Temporary config directory: $TEMP_CONFIG_DIR"
+
+if [ "$DRY_RUN" = true ]; then
+    print_warning "🧪 DRY RUN MODE - No actual transactions will be executed"
+fi
+
+echo "========================================"
+
+# Handle single supplier staking
+if [ -n "$SINGLE_SUPPLIER" ]; then
+    print_info "🎯 Single supplier mode: $SINGLE_SUPPLIER"
+    
+    # Find the supplier configuration for this owner address
+    if [ ! -f "$SUPPLIER_SVC_MAP_FILE" ]; then
+        print_error "Supplier service mapping file not found: $SUPPLIER_SVC_MAP_FILE"
+        exit 1
+    fi
+    
+    # Find line with matching owner address (second field)
+    supplier_line=$(grep -E "^[^ ]+ $SINGLE_SUPPLIER " "$SUPPLIER_SVC_MAP_FILE" | head -1)
+    
+    if [ -z "$supplier_line" ]; then
+        print_error "Owner address not found in mapping file: $SINGLE_SUPPLIER"
+        exit 1
+    fi
+    
+    # Parse the supplier line
+    read -r service_id owner_address operator_address stake_increment relayminer_url rest <<< "$supplier_line"
+    
+    # Parse revenue sharing arguments from the rest
+    rev_share_args=()
+    if [ -n "$rest" ]; then
+        read -ra rev_share_args <<< "$rest"
+    fi
+    
+    stake_supplier "$service_id" "$owner_address" "$operator_address" "$stake_increment" "$relayminer_url" "${rev_share_args[@]}"
+    exit 0
+fi
+
+# Check if the supplier service mapping file exists
+if [ ! -f "$SUPPLIER_SVC_MAP_FILE" ]; then
+    print_error "Supplier service mapping file not found: $SUPPLIER_SVC_MAP_FILE"
+    exit 1
+fi
+
+print_info "📖 Reading supplier service mappings from: $SUPPLIER_SVC_MAP_FILE"
+
+# Count total suppliers
+total_suppliers=$(grep -c "^[^#]" "$SUPPLIER_SVC_MAP_FILE" 2>/dev/null || wc -l < "$SUPPLIER_SVC_MAP_FILE")
+print_info "📊 Total suppliers to process: $total_suppliers"
+
+echo "========================================"
+
+# Process each line in the mapping file
+current_supplier=0
+failed_suppliers=0
+
+while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    
+    current_supplier=$((current_supplier + 1))
+    print_info "⚙️  Processing supplier $current_supplier/$total_suppliers"
+    
+    # Parse the line into components
+    read -r service_id owner_address operator_address stake_increment relayminer_url rest <<< "$line"
+    
+    # Validate required fields
+    if [ -z "$service_id" ] || [ -z "$owner_address" ] || [ -z "$operator_address" ] || [ -z "$stake_increment" ] || [ -z "$relayminer_url" ]; then
+        print_error "Invalid line format: $line"
+        print_error "Expected: <SERVICE_ID> <OWNER_ADDRESS> <OPERATOR_ADDRESS> <STAKE_AMOUNT_TO_INCREASE> <RELAYMINER_URL> [<REV_SHARE_ADDR1> <REV_SHARE_PCT1> ...]"
+        failed_suppliers=$((failed_suppliers + 1))
+        continue
+    fi
+    
+    # Validate stake increment is numeric
+    if ! [[ "$stake_increment" =~ ^[0-9]+$ ]]; then
+        print_error "Invalid stake increment (must be numeric): $stake_increment"
+        failed_suppliers=$((failed_suppliers + 1))
+        continue
+    fi
+    
+    # Parse revenue sharing arguments from the rest
+    rev_share_args=()
+    if [ -n "$rest" ]; then
+        read -ra rev_share_args <<< "$rest"
+    fi
+    
+    if ! stake_supplier "$service_id" "$owner_address" "$operator_address" "$stake_increment" "$relayminer_url" "${rev_share_args[@]}"; then
+        failed_suppliers=$((failed_suppliers + 1))
+        print_warning "Continuing with next supplier..."
+    fi
+    
+    # Add a small delay between transactions to avoid overwhelming the network
+    if [ "$DRY_RUN" = false ]; then
+        sleep 2
+    fi
+    
+done < "$SUPPLIER_SVC_MAP_FILE"
+
+echo "========================================"
+print_info "🏁 Processing complete!"
+print_info "📈 Total suppliers processed: $current_supplier"
+
+if [ $failed_suppliers -gt 0 ]; then
+    print_warning "⚠️  Failed suppliers: $failed_suppliers"
+    exit 1
+else
+    print_success "🎉 All suppliers staked successfully!"
+fi
